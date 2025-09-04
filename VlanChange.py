@@ -435,7 +435,7 @@ def push_config_with_retry(conn, commands, max_retries=3):
                             elif "Access Mode VLAN:" in line:
                                 vlan = line.split()[-1]
                                 if vlan != "1":  # Only add if not default VLAN
-                                    config_lines.append(f"switchport access vlan {vlan}")
+                                    config_lines.append(f"switchport access vlan 50")
                             elif "Voice VLAN:" in line:
                                 vlan = line.split()[-1]
                                 if vlan != "none":
