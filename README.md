@@ -1,6 +1,6 @@
 # VLAN Changer + CI/CD Pipeline
 
-[![CI](https://img.shields.io/github/actions/workflow/status/OWNER/REPO/network-ci-cd.yml?branch=main&label=CI%2FCD)](https://github.com/OWNER/REPO/actions/workflows/network-ci-cd.yml)
+[![CI](https://github.com/jmeza192/Vlan_Changer/actions/workflows/network-ci-cd.yml/badge.svg?branch=main)](https://github.com/jmeza192/Vlan_Changer/actions/workflows/network-ci-cd.yml)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org/downloads/)
 
 End‑to‑end VLAN change automation with verification, automatic rollback, and a GitHub Actions pipeline. Locates devices by IP or MAC, finds the access switchport (via CDP traversal and port‑channel awareness), applies the VLAN, verifies it, and optionally rolls back.
