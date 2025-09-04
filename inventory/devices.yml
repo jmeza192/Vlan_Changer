@@ -1,6 +1,6 @@
 devices:
   core1:
-    host: 198.168.1.197
+    host: 192.168.1.197
     device_type: cisco_ios
   edge1:
     host: 192.168.1.198
