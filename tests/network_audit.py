@@ -14,6 +14,7 @@ Key Functions:
 """
 
 import json
+import re
 import yaml
 import sys
 import os
@@ -135,9 +136,19 @@ class NetworkAuditor:
             if "Administrative Mode:" in line:
                 port_config.mode = line.split()[-1]
             elif "Access Mode VLAN:" in line:
-                port_config.access_vlan = line.split()[-1]
+                # Handle formats like: "Access Mode VLAN: 10 (VLAN0010)"
+                m = re.search(r"Access Mode VLAN:\s*(\d+)", line)
+                if m:
+                    port_config.access_vlan = m.group(1)
+                else:
+                    # Fallback to last token
+                    port_config.access_vlan = line.split()[-1]
             elif "Voice VLAN:" in line:
-                port_config.voice_vlan = line.split()[-1]
+                m = re.search(r"Voice VLAN:\s*(\d+|none)", line, re.I)
+                if m:
+                    port_config.voice_vlan = m.group(1).lower()
+                else:
+                    port_config.voice_vlan = line.split()[-1]
         
         # Parse status output
         for line in status_output.splitlines():
@@ -236,10 +247,11 @@ class NetworkAuditor:
             
             for line in output.splitlines():
                 line = line.strip()
-                if 'Po' in line and not line.startswith('Flags:'):
+                # Look only at lines that actually reference a Po<number>
+                if re.search(r"\bPo\d+\b", line) and not line.startswith(('Flags:', 'Group')):
                     parts = line.split()
                     for part in parts:
-                        if part.startswith('Po'):
+                        if re.match(r'^Po\d+$', part):
                             po_name = part
                             members = get_po_members(conn, po_name)
                             if members:
