@@ -5,16 +5,19 @@ on:
     inputs:
       target_device:
         description: 'Target device (e.g., edge1)'
-        required: true
+        required: false
         type: string
+        default: edge1
       target_interface:
         description: 'Target interface (e.g., GigabitEthernet0/1)'
-        required: true
+        required: false
         type: string
+        default: GigabitEthernet0/1
       target_vlan:
         description: 'Target VLAN ID'
-        required: true
+        required: false
         type: string
+        default: '20'
       skip_rollback:
         description: 'Skip automatic rollback'
         required: false
@@ -22,7 +25,7 @@ on:
         default: false
       environment:
         description: 'Environment to test against'
-        required: true
+        required: false
         type: choice
         options:
           - lab
@@ -41,4 +44,3 @@ jobs:
       skip_rollback: ${{ inputs.skip_rollback }}
       environment: ${{ inputs.environment }}
     secrets: inherit
-
