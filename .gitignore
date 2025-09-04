@@ -1,0 +1,19 @@
+.env
+venv/
+__pycache__/
+*.pyc
+*:Zone.Identifier
+
+# Excel files (switch lists, reports, etc.)
+*.xlsx
+*.xls
+
+# CSV reports
+tools/Check_Login/accessibility_report.csv
+
+# Session log files from network automation scripts
+session_log_*.txt
+**/session_log_*.txt
+
+# Any other log files
+*.log

@@ -1,0 +1,6 @@
+# which device/port the test will change (single-port E2E)
+target:
+  device: edge1
+  interface: GigabitEthernet0/1
+# VLAN to test (must be safe to use)
+test_vlan: 20

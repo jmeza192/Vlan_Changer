@@ -1,0 +1,580 @@
+name: Network VLAN Change CI/CD Pipeline
+
+# Trigger the workflow on different events
+on:
+  # Manual trigger with input parameters
+  workflow_dispatch:
+    inputs:
+      target_device:
+        description: 'Target device for VLAN change (e.g., edge1)'
+        required: true
+        type: string
+      target_interface:
+        description: 'Target interface (e.g., GigabitEthernet0/1)'
+        required: true
+        type: string
+      target_vlan:
+        description: 'Target VLAN ID'
+        required: true
+        type: string
+      skip_rollback:
+        description: 'Skip automatic rollback (for production changes)'
+        required: false
+        type: boolean
+        default: false
+      environment:
+        description: 'Environment to test against'
+        required: true
+        type: choice
+        options:
+          - lab
+          - staging
+          - production
+        default: lab
+  
+  # Automatic trigger on pull requests to main
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'VlanChange.py'
+      - 'tests/**'
+      - 'inventory/**'
+      - '.github/workflows/**'
+  
+  # Scheduled daily validation (at 2 AM UTC)
+  schedule:
+    - cron: '0 2 * * *'
+
+# Set default environment
+env:
+  PYTHON_VERSION: '3.9'
+  
+jobs:
+  # Job 0: Static Checks (runs on all PRs safely)
+  static-checks:
+    name: ✅ Static Checks
+    runs-on: ubuntu-latest
+    steps:
+    - name: 📥 Checkout repository
+      uses: actions/checkout@v4
+
+    - name: 🐍 Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: 📦 Install minimal dependencies
+      run: |
+        python -m pip install --upgrade pip
+        # Only what's needed for parsing/compile checks
+        pip install PyYAML
+
+    - name: 🔎 Python syntax check
+      run: |
+        python -m py_compile VlanChange.py
+        python - << 'PY'
+        import glob
+        import py_compile
+        for path in glob.glob('tests/*.py') + glob.glob('scripts/*.py'):
+            py_compile.compile(path, doraise=True)
+        PY
+
+    - name: 🧪 Import sanity checks
+      run: |
+        python - << 'PY'
+        import importlib
+        import sys
+        import yaml
+        # Basic imports shouldn't execute network calls
+        importlib.import_module('VlanChange')
+        for f in ('inventory/devices.yml','inventory/targets.yml'):
+            with open(f, 'r') as fh:
+                yaml.safe_load(fh)
+        print('Imports and YAML parse OK')
+        PY
+
+  # Job 1: Environment Validation
+  validate-environment:
+    name: 🔍 Validate Network Environment
+    runs-on: ubuntu-latest
+    # Skip network-reliant jobs on PRs unless using a self-hosted runner
+    if: github.event_name != 'pull_request' || contains(join(runner.labels, ','), 'self-hosted')
+    needs: static-checks
+    outputs:
+      environment-ready: ${{ steps.validation.outputs.ready }}
+      devices-count: ${{ steps.validation.outputs.devices_count }}
+    
+    steps:
+    - name: 📥 Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: 🐍 Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+    
+    - name: 📦 Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: 🔧 Setup environment variables
+      run: |
+        echo "PRIMARY_USERNAME=${{ secrets.NETWORK_USERNAME }}" >> .env
+        echo "PRIMARY_PASSWORD=${{ secrets.NETWORK_PASSWORD }}" >> .env
+        echo "FALLBACK_USER1=${{ secrets.FALLBACK_USER1 }}" >> .env
+        echo "FALLBACK_PASS1=${{ secrets.FALLBACK_PASS1 }}" >> .env
+        echo "FALLBACK_SECRET1=${{ secrets.FALLBACK_SECRET1 }}" >> .env
+        
+        # Add additional fallback credentials if they exist
+        if [ -n "${{ secrets.FALLBACK_USER2 }}" ]; then
+          echo "FALLBACK_USER2=${{ secrets.FALLBACK_USER2 }}" >> .env
+          echo "FALLBACK_PASS2=${{ secrets.FALLBACK_PASS2 }}" >> .env
+          echo "FALLBACK_SECRET2=${{ secrets.FALLBACK_SECRET2 }}" >> .env
+        fi
+    
+    - name: 🔍 Validate network connectivity
+      id: validation
+      run: |
+        echo "🔍 Testing network connectivity..."
+        
+        # Run environment validation
+        if python tests/test_vlan_e2e.py --validate-only; then
+          echo "ready=true" >> $GITHUB_OUTPUT
+          echo "✅ Network environment validation passed"
+        else
+          echo "ready=false" >> $GITHUB_OUTPUT
+          echo "❌ Network environment validation failed"
+          exit 1
+        fi
+        
+        # Count available devices
+        device_count=$(python -c "
+import yaml
+with open('inventory/devices.yml', 'r') as f:
+    data = yaml.safe_load(f)
+    print(len(data.get('devices', {})))
+")
+        echo "devices_count=$device_count" >> $GITHUB_OUTPUT
+        echo "📊 Available devices: $device_count"
+    
+    - name: 📋 Generate environment report
+      run: |
+        echo "## 🌐 Network Environment Status" >> $GITHUB_STEP_SUMMARY
+        echo "- **Environment**: ${{ github.event.inputs.environment || 'lab' }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Validation**: ✅ Passed" >> $GITHUB_STEP_SUMMARY
+        echo "- **Available Devices**: ${{ steps.validation.outputs.devices_count }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Timestamp**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+
+  # Job 2: Pre-Change Network Audit
+  pre-change-audit:
+    name: 📋 Pre-Change Network Audit
+    runs-on: ubuntu-latest
+    needs: validate-environment
+    if: needs.validate-environment.result == 'success'
+    if: needs.validate-environment.outputs.environment-ready == 'true'
+    outputs:
+      audit-file: ${{ steps.audit.outputs.filename }}
+    
+    steps:
+    - name: 📥 Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: 🐍 Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+    
+    - name: 📦 Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: 🔧 Setup environment variables
+      run: |
+        echo "PRIMARY_USERNAME=${{ secrets.NETWORK_USERNAME }}" >> .env
+        echo "PRIMARY_PASSWORD=${{ secrets.NETWORK_PASSWORD }}" >> .env
+        echo "FALLBACK_USER1=${{ secrets.FALLBACK_USER1 }}" >> .env
+        echo "FALLBACK_PASS1=${{ secrets.FALLBACK_PASS1 }}" >> .env
+        echo "FALLBACK_SECRET1=${{ secrets.FALLBACK_SECRET1 }}" >> .env
+        
+        if [ -n "${{ secrets.FALLBACK_USER2 }}" ]; then
+          echo "FALLBACK_USER2=${{ secrets.FALLBACK_USER2 }}" >> .env
+          echo "FALLBACK_PASS2=${{ secrets.FALLBACK_PASS2 }}" >> .env
+          echo "FALLBACK_SECRET2=${{ secrets.FALLBACK_SECRET2 }}" >> .env
+        fi
+    
+    - name: 📋 Perform network audit
+      id: audit
+      run: |
+        echo "🔍 Performing comprehensive network audit..."
+        
+        # Generate timestamp-based filename
+        TIMESTAMP=$(date -u '+%Y%m%d_%H%M%S')
+        AUDIT_FILE="pre_change_audit_${TIMESTAMP}.json"
+        
+        # Run network audit
+        python tests/network_audit.py --output "$AUDIT_FILE" --report
+        
+        # Output filename for next job
+        echo "filename=$AUDIT_FILE" >> $GITHUB_OUTPUT
+        
+        # Generate summary
+        echo "## 📋 Pre-Change Network Audit" >> $GITHUB_STEP_SUMMARY
+        echo "- **Audit File**: \`$AUDIT_FILE\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Devices Audited**: ${{ needs.validate-environment.outputs.devices-count }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Timestamp**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+    
+    - name: 📤 Upload audit artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: pre-change-audit
+        path: |
+          pre_change_audit_*.json
+          network_report_*.md
+        retention-days: 30
+
+  # Job 3: Execute VLAN Change Test
+  execute-vlan-change:
+    name: 🔧 Execute VLAN Change Test
+    runs-on: ubuntu-latest
+    needs: [validate-environment, pre-change-audit]
+    if: needs.validate-environment.outputs.environment-ready == 'true'
+    outputs:
+      test-success: ${{ steps.vlan-test.outputs.success }}
+      test-report: ${{ steps.vlan-test.outputs.report_file }}
+    
+    steps:
+    - name: 📥 Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: 🐍 Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+    
+    - name: 📦 Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: 🔧 Setup environment variables
+      run: |
+        echo "PRIMARY_USERNAME=${{ secrets.NETWORK_USERNAME }}" >> .env
+        echo "PRIMARY_PASSWORD=${{ secrets.NETWORK_PASSWORD }}" >> .env
+        echo "FALLBACK_USER1=${{ secrets.FALLBACK_USER1 }}" >> .env
+        echo "FALLBACK_PASS1=${{ secrets.FALLBACK_PASS1 }}" >> .env
+        echo "FALLBACK_SECRET1=${{ secrets.FALLBACK_SECRET1 }}" >> .env
+        
+        if [ -n "${{ secrets.FALLBACK_USER2 }}" ]; then
+          echo "FALLBACK_USER2=${{ secrets.FALLBACK_USER2 }}" >> .env
+          echo "FALLBACK_PASS2=${{ secrets.FALLBACK_PASS2 }}" >> .env
+          echo "FALLBACK_SECRET2=${{ secrets.FALLBACK_SECRET2 }}" >> .env
+        fi
+    
+    - name: 🔧 Configure test targets
+      run: |
+        # If manual trigger, update targets.yml with provided inputs
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "📝 Configuring test targets from workflow inputs..."
+          
+          cat > inventory/targets.yml << EOF
+        # Test target configuration - Updated by GitHub Actions
+        target:
+          device: ${{ github.event.inputs.target_device }}
+          interface: ${{ github.event.inputs.target_interface }}
+        
+        # VLAN to test (must be safe to use)
+        test_vlan: ${{ github.event.inputs.target_vlan }}
+        
+        # Test configuration
+        environment: ${{ github.event.inputs.environment }}
+        skip_rollback: ${{ github.event.inputs.skip_rollback }}
+        EOF
+          
+          echo "✅ Test targets configured:"
+          cat inventory/targets.yml
+        else
+          echo "📝 Using default test targets from repository"
+          cat inventory/targets.yml
+        fi
+    
+    - name: 🔧 Execute VLAN change test
+      id: vlan-test
+      run: |
+        echo "🚀 Starting VLAN change test..."
+        
+        # Determine cleanup behavior
+        CLEANUP_ARG=""
+        if [ "${{ github.event.inputs.skip_rollback }}" = "true" ]; then
+          CLEANUP_ARG="--no-cleanup"
+          echo "⚠️ Rollback disabled - changes will persist"
+        fi
+        
+        # Run the test
+        if python tests/test_vlan_e2e.py $CLEANUP_ARG; then
+          echo "success=true" >> $GITHUB_OUTPUT
+          echo "✅ VLAN change test completed successfully"
+        else
+          echo "success=false" >> $GITHUB_OUTPUT
+          echo "❌ VLAN change test failed"
+          exit 1
+        fi
+        
+        # Find and output the report file
+        REPORT_FILE=$(ls test_report_*.md | head -1)
+        echo "report_file=$REPORT_FILE" >> $GITHUB_OUTPUT
+        
+        # Add test summary to job summary
+        echo "## 🔧 VLAN Change Test Results" >> $GITHUB_STEP_SUMMARY
+        if [ -f "$REPORT_FILE" ]; then
+          echo "### Test Report Summary" >> $GITHUB_STEP_SUMMARY
+          head -20 "$REPORT_FILE" >> $GITHUB_STEP_SUMMARY
+        fi
+    
+    - name: 📤 Upload test artifacts
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: vlan-test-results
+        path: |
+          test_report_*.md
+          test_results.log
+          *_test_audit_*.json
+        retention-days: 30
+
+  # Job 4: Post-Change Validation
+  post-change-validation:
+    name: 🔍 Post-Change Validation
+    runs-on: ubuntu-latest
+    needs: [validate-environment, pre-change-audit, execute-vlan-change]
+    if: always() && needs.validate-environment.outputs.environment-ready == 'true'
+    
+    steps:
+    - name: 📥 Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: 🐍 Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+    
+    - name: 📦 Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: 🔧 Setup environment variables
+      run: |
+        echo "PRIMARY_USERNAME=${{ secrets.NETWORK_USERNAME }}" >> .env
+        echo "PRIMARY_PASSWORD=${{ secrets.NETWORK_PASSWORD }}" >> .env
+        echo "FALLBACK_USER1=${{ secrets.FALLBACK_USER1 }}" >> .env
+        echo "FALLBACK_PASS1=${{ secrets.FALLBACK_PASS1 }}" >> .env
+        echo "FALLBACK_SECRET1=${{ secrets.FALLBACK_SECRET1 }}" >> .env
+        
+        if [ -n "${{ secrets.FALLBACK_USER2 }}" ]; then
+          echo "FALLBACK_USER2=${{ secrets.FALLBACK_USER2 }}" >> .env
+          echo "FALLBACK_PASS2=${{ secrets.FALLBACK_PASS2 }}" >> .env
+          echo "FALLBACK_SECRET2=${{ secrets.FALLBACK_SECRET2 }}" >> .env
+        fi
+    
+    - name: 📥 Download pre-change audit
+      uses: actions/download-artifact@v4
+      with:
+        name: pre-change-audit
+        path: ./audit-artifacts/
+    
+    - name: 📋 Perform post-change audit
+      run: |
+        echo "🔍 Performing post-change network audit..."
+        
+        TIMESTAMP=$(date -u '+%Y%m%d_%H%M%S')
+        POST_AUDIT_FILE="post_change_audit_${TIMESTAMP}.json"
+        
+        python tests/network_audit.py --output "$POST_AUDIT_FILE" --report
+        
+        echo "POST_AUDIT_FILE=$POST_AUDIT_FILE" >> $GITHUB_ENV
+    
+    - name: 🔍 Compare network states
+      run: |
+        echo "🔍 Comparing pre and post-change network states..."
+        
+        # Find the pre-change audit file
+        PRE_AUDIT_FILE=$(find ./audit-artifacts/ -name "pre_change_audit_*.json" | head -1)
+        
+        if [ -f "$PRE_AUDIT_FILE" ]; then
+          echo "📊 Comparing: $PRE_AUDIT_FILE vs $POST_AUDIT_FILE"
+          
+          # Run comparison
+          python tests/network_audit.py --compare "$PRE_AUDIT_FILE" "$POST_AUDIT_FILE" > comparison_report.txt
+          
+          echo "## 🔍 Network State Comparison" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat comparison_report.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+        else
+          echo "⚠️ Pre-change audit file not found"
+          echo "## ⚠️ Comparison Skipped" >> $GITHUB_STEP_SUMMARY
+          echo "Pre-change audit file not available for comparison" >> $GITHUB_STEP_SUMMARY
+        fi
+    
+    - name: 📤 Upload validation artifacts
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: post-change-validation
+        path: |
+          post_change_audit_*.json
+          network_report_*.md
+          comparison_report.txt
+        retention-days: 30
+
+  # Job 5: Generate Final Report
+  generate-report:
+    name: 📄 Generate Final CI/CD Report
+    runs-on: ubuntu-latest
+    needs: [validate-environment, pre-change-audit, execute-vlan-change, post-change-validation]
+    if: always()
+    
+    steps:
+    - name: 📥 Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: 📥 Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: ./all-artifacts/
+    
+    - name: 📄 Generate comprehensive report
+      run: |
+        TIMESTAMP=$(date -u '+%Y%m%d_%H%M%S')
+        REPORT_FILE="cicd_report_${TIMESTAMP}.md"
+        
+        cat > "$REPORT_FILE" << 'EOF'
+        # 🔬 Network VLAN Change CI/CD Report
+        
+        ## 📋 Pipeline Summary
+        
+        **Pipeline Run**: `${{ github.run_number }}`  
+        **Workflow**: `${{ github.workflow }}`  
+        **Trigger**: `${{ github.event_name }}`  
+        **Branch**: `${{ github.ref_name }}`  
+        **Commit**: `${{ github.sha }}`  
+        **Timestamp**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+        
+        ## 🎯 Test Configuration
+        
+        EOF
+        
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          cat >> "$REPORT_FILE" << 'EOF'
+        **Target Device**: `${{ github.event.inputs.target_device }}`  
+        **Target Interface**: `${{ github.event.inputs.target_interface }}`  
+        **Target VLAN**: `${{ github.event.inputs.target_vlan }}`  
+        **Environment**: `${{ github.event.inputs.environment }}`  
+        **Skip Rollback**: `${{ github.event.inputs.skip_rollback }}`
+        EOF
+        else
+          echo "**Test Mode**: Automated (using default targets from repository)" >> "$REPORT_FILE"
+        fi
+        
+        cat >> "$REPORT_FILE" << 'EOF'
+        
+        ## 📊 Job Results
+        
+        | Job | Status | Notes |
+        |-----|--------|-------|
+        | Environment Validation | ${{ needs.validate-environment.result == 'success' && '✅ Success' || '❌ Failed' }} | ${{ needs.validate-environment.outputs.devices-count }} devices available |
+        | Pre-Change Audit | ${{ needs.pre-change-audit.result == 'success' && '✅ Success' || '❌ Failed' }} | Network state captured |
+        | VLAN Change Test | ${{ needs.execute-vlan-change.result == 'success' && '✅ Success' || '❌ Failed' }} | ${{ needs.execute-vlan-change.outputs.test-success == 'true' && 'Test passed' || 'Test failed' }} |
+        | Post-Change Validation | ${{ needs.post-change-validation.result == 'success' && '✅ Success' || '❌ Failed' }} | Network state compared |
+        
+        ## 🎯 Overall Result
+        
+        EOF
+        
+        if [ "${{ needs.execute-vlan-change.outputs.test-success }}" = "true" ]; then
+          echo "**✅ PIPELINE PASSED** - All tests completed successfully" >> "$REPORT_FILE"
+        else
+          echo "**❌ PIPELINE FAILED** - One or more tests failed" >> "$REPORT_FILE"
+        fi
+        
+        cat >> "$REPORT_FILE" << 'EOF'
+        
+        ## 📁 Artifacts Generated
+        
+        The following artifacts were generated during this pipeline run:
+        
+        - **Pre-Change Audit**: Network state before changes
+        - **Test Results**: Detailed test execution logs and reports  
+        - **Post-Change Validation**: Network state after changes and comparison
+        - **CI/CD Report**: This comprehensive summary
+        
+        ## 🔗 Links
+        
+        - **Workflow Run**: [${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+        - **Repository**: [${{ github.repository }}](${{ github.server_url }}/${{ github.repository }})
+        - **Commit**: [${{ github.sha }}](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
+        
+        ---
+        *Generated by GitHub Actions on $(date -u '+%Y-%m-%d %H:%M:%S UTC')*
+        EOF
+        
+        echo "REPORT_FILE=$REPORT_FILE" >> $GITHUB_ENV
+        
+        # Add to job summary
+        cat "$REPORT_FILE" >> $GITHUB_STEP_SUMMARY
+    
+    - name: 📤 Upload final report
+      uses: actions/upload-artifact@v4
+      with:
+        name: cicd-final-report
+        path: |
+          cicd_report_*.md
+        retention-days: 90
+
+  # Job 6: Notification (only on failure or manual trigger)
+  notification:
+    name: 📢 Send Notifications
+    runs-on: ubuntu-latest
+    needs: [validate-environment, pre-change-audit, execute-vlan-change, post-change-validation]
+    if: always() && (failure() || github.event_name == 'workflow_dispatch')
+    
+    steps:
+    - name: 📢 Notify on failure
+      if: failure()
+      run: |
+        echo "## ⚠️ Pipeline Failure Notification" >> $GITHUB_STEP_SUMMARY
+        echo "The VLAN change CI/CD pipeline has failed." >> $GITHUB_STEP_SUMMARY
+        echo "Please review the job logs and artifacts for details." >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Failed Jobs:**" >> $GITHUB_STEP_SUMMARY
+        
+        if [ "${{ needs.validate-environment.result }}" = "failure" ]; then
+          echo "- ❌ Environment Validation" >> $GITHUB_STEP_SUMMARY
+        fi
+        if [ "${{ needs.pre-change-audit.result }}" = "failure" ]; then
+          echo "- ❌ Pre-Change Audit" >> $GITHUB_STEP_SUMMARY
+        fi
+        if [ "${{ needs.execute-vlan-change.result }}" = "failure" ]; then
+          echo "- ❌ VLAN Change Test" >> $GITHUB_STEP_SUMMARY
+        fi
+        if [ "${{ needs.post-change-validation.result }}" = "failure" ]; then
+          echo "- ❌ Post-Change Validation" >> $GITHUB_STEP_SUMMARY
+        fi
+    
+    - name: 📢 Notify on manual success
+      if: success() && github.event_name == 'workflow_dispatch'
+      run: |
+        echo "## ✅ Manual Pipeline Success" >> $GITHUB_STEP_SUMMARY
+        echo "The manually triggered VLAN change has completed successfully." >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Configuration:**" >> $GITHUB_STEP_SUMMARY
+        echo "- Device: ${{ github.event.inputs.target_device }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Interface: ${{ github.event.inputs.target_interface }}" >> $GITHUB_STEP_SUMMARY
+        echo "- VLAN: ${{ github.event.inputs.target_vlan }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Rollback: ${{ github.event.inputs.skip_rollback == 'true' && 'Skipped' || 'Performed' }}" >> $GITHUB_STEP_SUMMARY
