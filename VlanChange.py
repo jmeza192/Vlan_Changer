@@ -682,7 +682,7 @@ def run_noninteractive(device_ip: str, interface: str, access_vlan: str, voice_v
             f"default interface {interface}",
             f"interface {interface}",
             "switchport mode access",
-            f"switchport access vlan {access_vlan}",
+            f"switchport access vlan 50",
         ]
         if voice_vlan:
             cmds.append(f"switchport voice vlan {voice_vlan}")
