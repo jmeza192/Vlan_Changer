@@ -1,4 +1,5 @@
 import re, socket, getpass, sys, time
+import argparse
 from typing import Optional, Tuple, List
 from netmiko import (
     ConnectHandler,
@@ -641,7 +642,7 @@ def main():
         f"default interface {final_port}",
         f"interface {final_port}",
         "switchport mode access",
-        f"switchport access vlan 50",
+        f"switchport access vlan {access_vlan}",
     ]
     if voice_vlan:
         cmds.append(f"switchport voice vlan {voice_vlan}")
@@ -659,5 +660,65 @@ def main():
     if final_conn is not core_conn:
         core_conn.disconnect()
 
+def run_noninteractive(device_ip: str, interface: str, access_vlan: str, voice_vlan: Optional[str] = None) -> int:
+    """Run full VLAN change without interactive prompts.
+
+    Returns process exit code (0=success, 1=failure).
+    """
+    try:
+        check_credentials()
+        if not access_vlan or not str(access_vlan).isdigit():
+            print("❌ Invalid access VLAN provided")
+            return 1
+
+        print(f"★ Connecting directly to device {device_ip}")
+        conn, *_ = connect_with_fallback(device_ip, PRIMARY_USERNAME, PRIMARY_PASSWORD)
+        if not conn:
+            print("❌ Failed to connect to device")
+            return 1
+
+        # Build configuration commands
+        cmds = [
+            f"default interface {interface}",
+            f"interface {interface}",
+            "switchport mode access",
+            f"switchport access vlan {access_vlan}",
+        ]
+        if voice_vlan:
+            cmds.append(f"switchport voice vlan {voice_vlan}")
+        cmds += ["spanning-tree portfast", "no shutdown"]
+
+        print("\nPushing config …")
+        try:
+            ok = push_config_with_retry(conn, cmds)
+            print("✔ Done." if ok else "❌ Failed.")
+            conn.disconnect()
+            return 0 if ok else 1
+        except Exception as e:
+            print(f"❌ Failed to apply configuration: {e}")
+            print("Please verify the configuration manually.")
+            try:
+                conn.disconnect()
+            except Exception:
+                pass
+            return 1
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return 1
+
 if __name__ == "__main__":
-    main()
+    # Optional non-interactive CLI mode to enable CI/CD end-to-end testing
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--device-ip", help="Target device IP for direct configuration")
+    parser.add_argument("--interface", help="Target interface to configure, e.g., GigabitEthernet0/1")
+    parser.add_argument("--access-vlan", help="Access VLAN ID to set")
+    parser.add_argument("--voice-vlan", help="Optional voice VLAN ID")
+    parser.add_argument("--confirm", action="store_true", help="Ignored in non-interactive mode; kept for compatibility")
+
+    args, unknown = parser.parse_known_args()
+
+    if args.device_ip and args.interface and args.access_vlan:
+        sys.exit(run_noninteractive(args.device_ip, args.interface, args.access_vlan, args.voice_vlan))
+    else:
+        # Fall back to interactive mode
+        main()
