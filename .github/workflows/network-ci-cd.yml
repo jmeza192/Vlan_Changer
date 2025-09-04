@@ -2,6 +2,7 @@ name: Network VLAN Change CI/CD Pipeline
 
 # Trigger the workflow on different events
 on:
+  #test
   # Manual trigger with input parameters
   workflow_dispatch:
     inputs:
