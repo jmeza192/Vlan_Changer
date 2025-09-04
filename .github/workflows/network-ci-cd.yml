@@ -348,38 +348,99 @@ jobs:
           cat inventory/targets.yml
         fi
     
-    - name: 🔧 Execute VLAN change test
+    - name: 🔧 Execute VLAN change via full script
       id: vlan-test
       run: |
-        echo "🚀 Starting VLAN change test..."
-        
-        # Determine cleanup behavior
-        CLEANUP_ARG=""
-        if [ "${{ inputs.skip_rollback || github.event.inputs.skip_rollback }}" = "true" ]; then
-          CLEANUP_ARG="--no-cleanup"
-          echo "⚠️ Rollback disabled - changes will persist"
-        fi
-        
-        # Run the test
-        if python tests/test_vlan_e2e.py $CLEANUP_ARG; then
-          echo "success=true" >> $GITHUB_OUTPUT
-          echo "✅ VLAN change test completed successfully"
-        else
-          echo "success=false" >> $GITHUB_OUTPUT
-          echo "❌ VLAN change test failed"
-          exit 1
-        fi
-        
-        # Find and output the report file
-        REPORT_FILE=$(ls test_report_*.md | head -1)
-        echo "report_file=$REPORT_FILE" >> $GITHUB_OUTPUT
-        
-        # Add test summary to job summary
-        echo "## 🔧 VLAN Change Test Results" >> $GITHUB_STEP_SUMMARY
-        if [ -f "$REPORT_FILE" ]; then
-          echo "### Test Report Summary" >> $GITHUB_STEP_SUMMARY
-          head -20 "$REPORT_FILE" >> $GITHUB_STEP_SUMMARY
-        fi
+        echo "🚀 Running VlanChange.py end-to-end (non-interactive) ..."
+        python - << 'PY'
+        import os, sys, re, subprocess, yaml
+        from pathlib import Path
+
+        # Load target from repo configs
+        targets = yaml.safe_load(open('inventory/targets.yml'))
+        devices = yaml.safe_load(open('inventory/devices.yml'))['devices']
+        dev_name = targets['target']['device']
+        interface = targets['target']['interface']
+        test_vlan = str(targets['test_vlan'])
+        device_ip = devices[dev_name]['host']
+
+        # Prepare env/output files from GitHub Actions
+        env_file = os.environ.get('GITHUB_ENV')
+        out_file = os.environ.get('GITHUB_OUTPUT')
+        step_summary = os.environ.get('GITHUB_STEP_SUMMARY')
+
+        # Capture current VLAN
+        from VlanChange import connect_with_fallback
+        conn, *_ = connect_with_fallback(device_ip, os.getenv('PRIMARY_USERNAME'), os.getenv('PRIMARY_PASSWORD'))
+        if not conn:
+            print('❌ Could not connect to device for pre-check', file=sys.stderr)
+            sys.exit(1)
+        cfg = conn.send_command(f"show run interface {interface}", read_timeout=60, cmd_verify=False)
+        m = re.search(r"switchport access vlan (\d+)", cfg)
+        original_vlan = m.group(1) if m else '1'
+        if env_file:
+            with open(env_file, 'a') as f:
+                f.write(f"ORIGINAL_VLAN={original_vlan}\n")
+
+        # Run full script
+        cmd = [sys.executable, 'VlanChange.py', '--device-ip', device_ip, '--interface', interface, '--access-vlan', test_vlan, '--confirm']
+        print('Command:', ' '.join(cmd))
+        with open('vlanchange_run.log', 'w') as log:
+            ret = subprocess.call(cmd, stdout=log, stderr=subprocess.STDOUT)
+        if ret != 0:
+            if out_file:
+                with open(out_file, 'a') as f:
+                    f.write('success=false\n')
+                    f.write('report_file=vlanchange_run.log\n')
+            print('❌ VlanChange.py returned non-zero exit', file=sys.stderr)
+            sys.exit(1)
+
+        # Verify VLAN applied
+        cfg_after = conn.send_command(f"show run interface {interface}", read_timeout=60, cmd_verify=False)
+        m2 = re.search(r"switchport access vlan (\d+)", cfg_after)
+        current_vlan = m2.group(1) if m2 else '1'
+        summary = Path(step_summary) if step_summary else None
+        if current_vlan != test_vlan:
+            if out_file:
+                with open(out_file, 'a') as f:
+                    f.write('success=false\n')
+                    f.write('report_file=vlanchange_run.log\n')
+            if summary:
+                summary.write_text("## 🔧 VLAN Change Test Results\n❌ VLAN verification failed\n")
+            print(f"❌ Verification failed: expected VLAN {test_vlan}, found {current_vlan}", file=sys.stderr)
+            sys.exit(1)
+
+        if out_file:
+            with open(out_file, 'a') as f:
+                f.write('success=true\n')
+                f.write('report_file=vlanchange_run.log\n')
+        if summary:
+            with open(step_summary, 'a') as s:
+                s.write("## 🔧 VLAN Change Test Results\n")
+                s.write(f"✅ VLAN {test_vlan} applied on {interface} at {device_ip}\n")
+
+        try:
+            conn.disconnect()
+        except Exception:
+            pass
+        PY
+
+    - name: 🔄 Rollback VLAN change (if not skipped)
+      if: ${{ inputs.skip_rollback != true && github.event.inputs.skip_rollback != 'true' }}
+      run: |
+        echo "↩️ Rolling back to original VLAN: ${ORIGINAL_VLAN}"
+        python - << 'PY'
+        import os, sys, yaml, subprocess
+        targets = yaml.safe_load(open('inventory/targets.yml'))
+        devices = yaml.safe_load(open('inventory/devices.yml'))['devices']
+        dev_name = targets['target']['device']
+        interface = targets['target']['interface']
+        device_ip = devices[dev_name]['host']
+        original_vlan = os.getenv('ORIGINAL_VLAN', '1')
+        cmd = [sys.executable, 'VlanChange.py', '--device-ip', device_ip, '--interface', interface, '--access-vlan', original_vlan, '--confirm']
+        print('Command:', ' '.join(cmd))
+        sys.exit(subprocess.call(cmd))
+        PY
     
     - name: 📤 Upload test artifacts
       uses: actions/upload-artifact@v4
@@ -389,7 +450,9 @@ jobs:
         path: |
           test_report_*.md
           test_results.log
+          vlanchange_run.log
           *_test_audit_*.json
+        if-no-files-found: ignore
         retention-days: 30
 
   # Job 4: Post-Change Validation
