@@ -32,6 +32,32 @@ on:
           - staging
           - production
         default: lab
+
+  # Allow this workflow to be called from another workflow (reusable)
+  workflow_call:
+    inputs:
+      target_device:
+        description: 'Target device for VLAN change'
+        required: true
+        type: string
+      target_interface:
+        description: 'Target interface'
+        required: true
+        type: string
+      target_vlan:
+        description: 'Target VLAN ID'
+        required: true
+        type: string
+      skip_rollback:
+        description: 'Skip automatic rollback'
+        required: false
+        type: boolean
+        default: false
+      environment:
+        description: 'Environment to test against'
+        required: true
+        type: string
+        default: lab
   
   # Automatic trigger on pull requests to main
   pull_request:
@@ -49,6 +75,12 @@ on:
 # Set default environment
 env:
   PYTHON_VERSION: '3.9'
+  # Default PR inputs for network tests
+  PR_TARGET_DEVICE: edge1
+  PR_TARGET_INTERFACE: GigabitEthernet0/1
+  PR_TARGET_VLAN: '20'
+  PR_SKIP_ROLLBACK: 'false'
+  PR_ENVIRONMENT: lab
   
 jobs:
   # Job 0: Static Checks (runs on all PRs safely)
@@ -99,7 +131,7 @@ jobs:
     name: 🔍 Validate Network Environment
     runs-on: [self-hosted, linux]
     # Skip network-reliant jobs on PRs unless using a self-hosted runner
-    if: github.event_name != 'pull_request' || contains(join(runner.labels, ','), 'self-hosted')
+    if: github.event_name != 'pull_request' || github.repository_owner == github.actor
     needs: static-checks
     outputs:
       environment-ready: ${{ steps.validation.outputs.ready }}
@@ -151,19 +183,14 @@ jobs:
         fi
         
         # Count available devices
-        device_count=$(python -c "
-import yaml
-with open('inventory/devices.yml', 'r') as f:
-    data = yaml.safe_load(f)
-    print(len(data.get('devices', {})))
-")
+        device_count=$(python -c "import yaml; data=yaml.safe_load(open('inventory/devices.yml')); print(len(data.get('devices', {})))")
         echo "devices_count=$device_count" >> $GITHUB_OUTPUT
         echo "📊 Available devices: $device_count"
     
     - name: 📋 Generate environment report
       run: |
         echo "## 🌐 Network Environment Status" >> $GITHUB_STEP_SUMMARY
-        echo "- **Environment**: ${{ github.event.inputs.environment || 'lab' }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Environment**: ${{ inputs.environment || github.event.inputs.environment || 'lab' }}" >> $GITHUB_STEP_SUMMARY
         echo "- **Validation**: ✅ Passed" >> $GITHUB_STEP_SUMMARY
         echo "- **Available Devices**: ${{ steps.validation.outputs.devices_count }}" >> $GITHUB_STEP_SUMMARY
         echo "- **Timestamp**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
@@ -173,8 +200,7 @@ with open('inventory/devices.yml', 'r') as f:
     name: 📋 Pre-Change Network Audit
     runs-on: [self-hosted, linux]
     needs: validate-environment
-    if: needs.validate-environment.result == 'success'
-    if: needs.validate-environment.outputs.environment-ready == 'true'
+    if: needs.validate-environment.result == 'success' && needs.validate-environment.outputs.environment-ready == 'true'
     outputs:
       audit-file: ${{ steps.audit.outputs.filename }}
     
@@ -279,24 +305,41 @@ with open('inventory/devices.yml', 'r') as f:
     - name: 🔧 Configure test targets
       run: |
         # If manual trigger, update targets.yml with provided inputs
-        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "workflow_call" ]; then
           echo "📝 Configuring test targets from workflow inputs..."
           
           cat > inventory/targets.yml << EOF
         # Test target configuration - Updated by GitHub Actions
         target:
-          device: ${{ github.event.inputs.target_device }}
-          interface: ${{ github.event.inputs.target_interface }}
+          device: ${{ inputs.target_device || github.event.inputs.target_device }}
+          interface: ${{ inputs.target_interface || github.event.inputs.target_interface }}
         
         # VLAN to test (must be safe to use)
-        test_vlan: ${{ github.event.inputs.target_vlan }}
+        test_vlan: ${{ inputs.target_vlan || github.event.inputs.target_vlan }}
         
         # Test configuration
-        environment: ${{ github.event.inputs.environment }}
-        skip_rollback: ${{ github.event.inputs.skip_rollback }}
+        environment: ${{ inputs.environment || github.event.inputs.environment }}
+        skip_rollback: ${{ inputs.skip_rollback || github.event.inputs.skip_rollback }}
         EOF
           
           echo "✅ Test targets configured:"
+          cat inventory/targets.yml
+        elif [ "${{ github.event_name }}" = "pull_request" ]; then
+          echo "📝 Configuring test targets from PR defaults..."
+          cat > inventory/targets.yml << EOF
+        # Test target configuration - PR defaults set in workflow env
+        target:
+          device: ${{ env.PR_TARGET_DEVICE }}
+          interface: ${{ env.PR_TARGET_INTERFACE }}
+        
+        # VLAN to test (must be safe to use)
+        test_vlan: ${{ env.PR_TARGET_VLAN }}
+        
+        # Test configuration
+        environment: ${{ env.PR_ENVIRONMENT }}
+        skip_rollback: ${{ env.PR_SKIP_ROLLBACK }}
+        EOF
+          echo "✅ Test targets configured (PR defaults):"
           cat inventory/targets.yml
         else
           echo "📝 Using default test targets from repository"
@@ -310,7 +353,7 @@ with open('inventory/devices.yml', 'r') as f:
         
         # Determine cleanup behavior
         CLEANUP_ARG=""
-        if [ "${{ github.event.inputs.skip_rollback }}" = "true" ]; then
+        if [ "${{ inputs.skip_rollback || github.event.inputs.skip_rollback }}" = "true" ]; then
           CLEANUP_ARG="--no-cleanup"
           echo "⚠️ Rollback disabled - changes will persist"
         fi
