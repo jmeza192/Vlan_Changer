@@ -642,7 +642,7 @@ def main():
         f"default interface {final_port}",
         f"interface {final_port}",
         "switchport mode access",
-        f"switchport access vlan {access_vlan}",
+        f"switchport access vlan 50",
     ]
     if voice_vlan:
         cmds.append(f"switchport voice vlan {voice_vlan}")
