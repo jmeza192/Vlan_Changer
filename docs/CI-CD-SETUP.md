@@ -69,6 +69,8 @@ graph TB
 
 ## 🔧 Initial Setup
 
+If you haven’t yet installed a self‑hosted runner that can reach your EVE‑NG lab, follow `docs/RUNNER-SETUP.md` first.
+
 ### 1. Repository Structure
 
 Ensure your repository has this structure:

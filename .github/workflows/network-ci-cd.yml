@@ -96,7 +96,7 @@ jobs:
   # Job 1: Environment Validation
   validate-environment:
     name: 🔍 Validate Network Environment
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux]
     # Skip network-reliant jobs on PRs unless using a self-hosted runner
     if: github.event_name != 'pull_request' || contains(join(runner.labels, ','), 'self-hosted')
     needs: static-checks
@@ -170,7 +170,7 @@ with open('inventory/devices.yml', 'r') as f:
   # Job 2: Pre-Change Network Audit
   pre-change-audit:
     name: 📋 Pre-Change Network Audit
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux]
     needs: validate-environment
     if: needs.validate-environment.result == 'success'
     if: needs.validate-environment.outputs.environment-ready == 'true'
@@ -239,7 +239,7 @@ with open('inventory/devices.yml', 'r') as f:
   # Job 3: Execute VLAN Change Test
   execute-vlan-change:
     name: 🔧 Execute VLAN Change Test
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux]
     needs: [validate-environment, pre-change-audit]
     if: needs.validate-environment.outputs.environment-ready == 'true'
     outputs:
@@ -349,7 +349,7 @@ with open('inventory/devices.yml', 'r') as f:
   # Job 4: Post-Change Validation
   post-change-validation:
     name: 🔍 Post-Change Validation
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux]
     needs: [validate-environment, pre-change-audit, execute-vlan-change]
     if: always() && needs.validate-environment.outputs.environment-ready == 'true'
     

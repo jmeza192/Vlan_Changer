@@ -118,3 +118,14 @@ Pushing config …
 - Configuration verification before completion
 - Detailed error messages and debugging output
 - Graceful handling of network topology changes
+
+## CI/CD Testing with EVE‑NG
+
+- A full GitHub Actions pipeline is included at `.github/workflows/network-ci-cd.yml`.
+- For network tests to run, use a self‑hosted runner with access to your lab.
+- See `docs/RUNNER-SETUP.md` for runner installation and `docs/CI-CD-SETUP.md` for end‑to‑end usage.
+
+Quick start:
+- Update `inventory/devices.yml` with your lab IPs.
+- Add repo secrets: `NETWORK_USERNAME`, `NETWORK_PASSWORD` (plus optional fallbacks).
+- From Actions, run “Network VLAN Change CI/CD Pipeline” with target device/interface/VLAN.
